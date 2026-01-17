@@ -2,9 +2,7 @@
 
 **Works with any models, BYOK, written in Rust** 🚀
 
-https://github.com/user-attachments/assets/bc9c5bb8-e568-4320-9b12-9e5c92c1dcae
-
-*Demo video: Kuse Cowork in action*
+[*Demo video: Kuse Cowork in action*](https://github.com/user-attachments/assets/e128e657-c1be-4134-828d-01a9a94ef055)
 
 ## ✨ Why Kuse Cowork?
 
