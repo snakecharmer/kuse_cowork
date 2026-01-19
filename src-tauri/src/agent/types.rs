@@ -45,16 +45,6 @@ impl ToolResult {
         }
     }
 
-    pub fn success_with_signature(tool_use_id: String, content: String, thought_signature: Option<String>) -> Self {
-        Self {
-            result_type: "tool_result".to_string(),
-            tool_use_id,
-            content,
-            is_error: None,
-            thought_signature,
-        }
-    }
-
     pub fn error(tool_use_id: String, error: String) -> Self {
         Self {
             result_type: "tool_result".to_string(),
@@ -62,16 +52,6 @@ impl ToolResult {
             content: error,
             is_error: Some(true),
             thought_signature: None,
-        }
-    }
-
-    pub fn error_with_signature(tool_use_id: String, error: String, thought_signature: Option<String>) -> Self {
-        Self {
-            result_type: "tool_result".to_string(),
-            tool_use_id,
-            content: error,
-            is_error: Some(true),
-            thought_signature,
         }
     }
 }

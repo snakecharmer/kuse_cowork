@@ -1,5 +1,5 @@
 import { Component, createSignal, createMemo, Show } from "solid-js";
-import { useSettings, AVAILABLE_MODELS, PROVIDER_PRESETS, getProviderFromModel, providerRequiresApiKey } from "../stores/settings";
+import { useSettings, AVAILABLE_MODELS, PROVIDER_PRESETS, getProviderFromModel } from "../stores/settings";
 import { testConnection } from "../lib/tauri-api";
 import ModelSelector from "./ModelSelector";
 import "./Settings.css";

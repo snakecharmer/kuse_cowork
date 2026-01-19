@@ -4,6 +4,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum LLMError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
@@ -16,9 +17,10 @@ pub enum LLMError {
 }
 
 /// API format type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApiFormat {
+    #[default]
     Anthropic,
     OpenAI,
     OpenAICompatible,
@@ -27,26 +29,15 @@ pub enum ApiFormat {
     Minimax,
 }
 
-impl Default for ApiFormat {
-    fn default() -> Self {
-        Self::Anthropic
-    }
-}
-
 /// Authentication type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthType {
     None,
+    #[default]
     Bearer,
     ApiKey,
     QueryParam,
-}
-
-impl Default for AuthType {
-    fn default() -> Self {
-        Self::Bearer
-    }
 }
 
 /// Provider configuration
@@ -282,6 +273,7 @@ impl LLMClient {
     }
 
     /// Get API format
+    #[allow(dead_code)]
     pub fn api_format(&self) -> &ApiFormat {
         &self.provider_config.api_format
     }
@@ -902,6 +894,7 @@ impl LLMClient {
     }
 
     /// Discover available models
+    #[allow(dead_code)]
     pub async fn discover_models(&self) -> Result<Vec<String>, LLMError> {
         let base = self.base_url.trim_end_matches('/');
 

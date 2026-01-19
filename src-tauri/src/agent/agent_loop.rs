@@ -9,6 +9,7 @@ use reqwest::Client;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[allow(dead_code)]
 pub struct AgentLoop {
     client: Client,
     api_key: String,
@@ -24,6 +25,7 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    #[allow(dead_code)]
     pub fn new(
         api_key: String,
         base_url: String,

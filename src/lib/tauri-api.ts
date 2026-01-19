@@ -176,6 +176,8 @@ export async function testConnection(): Promise<string> {
       model: settings.model,
       baseUrl: settings.base_url,
       maxTokens: settings.max_tokens,
+      temperature: settings.temperature,
+      providerKeys: settings.provider_keys || {},
     };
 
     return testAIConnection(convertedSettings);
@@ -284,6 +286,8 @@ export async function sendChatMessage(
       model: settings.model,
       baseUrl: settings.base_url,
       maxTokens: settings.max_tokens,
+      temperature: settings.temperature,
+      providerKeys: settings.provider_keys || {},
     };
 
     const fullText = await sendAIMessage(messages, convertedSettings, onStream);

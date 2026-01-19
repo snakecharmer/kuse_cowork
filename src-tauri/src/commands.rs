@@ -904,7 +904,7 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
                                     // Check if finished
                                     if choice.get("finish_reason").and_then(|v| v.as_str()).is_some() {
                                         // Convert collected tool_calls to ToolUse
-                                        for (_idx, (id, name, args)) in &current_tool_calls {
+                                        for (id, name, args) in current_tool_calls.values() {
                                             if !id.is_empty() && !name.is_empty() {
                                                 let input: serde_json::Value = serde_json::from_str(args)
                                                     .unwrap_or(serde_json::json!({}));

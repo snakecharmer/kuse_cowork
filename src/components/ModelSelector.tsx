@@ -62,7 +62,7 @@ const ModelSelector: Component<ModelSelectorProps> = (props) => {
   const [providerType, setProviderType] = createSignal<ProviderType>(getCurrentProviderType());
   const [ollamaStatus, setOllamaStatus] = createSignal<OllamaStatus>("checking");
   const [ollamaModels, setOllamaModels] = createSignal<OllamaModel[]>([]);
-  const [ollamaBaseUrl, setOllamaBaseUrl] = createSignal("http://localhost:11434");
+  const [ollamaBaseUrl, _setOllamaBaseUrl] = createSignal("http://localhost:11434");
 
   // Cloud provider categories
   const cloudProviderCategories = {
