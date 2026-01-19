@@ -693,6 +693,9 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
         crate::llm_client::ApiFormat::Google
     );
 
+    // For Google: track thoughtSignature per function call across iterations (required for Gemini 3)
+    let mut google_thought_signatures: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
     loop {
         turn += 1;
         if turn > max_turns {
@@ -703,8 +706,8 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
         let api_request = message_builder.build_request(&agent_messages).await;
 
         let response = if use_google_format {
-            // Google Gemini format request
-            let google_request = convert_to_google_format(&api_request, &settings.model, settings.max_tokens);
+            // Google Gemini format request (pass thought signatures for Gemini 3 function calling)
+            let google_request = convert_to_google_format(&api_request, &settings.model, settings.max_tokens, &google_thought_signatures);
             let base = provider_config.base_url.trim_end_matches('/');
             let url = format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, settings.model);
 
@@ -810,16 +813,27 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
                                                 });
                                             }
                                         }
-                                        // Handle function calls
+                                        // Handle function calls (with thoughtSignature for Gemini 3)
                                         if let Some(fc) = part.get("functionCall") {
                                             let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                             let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
                                             let id = format!("fc_{}", uuid::Uuid::new_v4());
 
+                                            // Capture thoughtSignature from the same part (required for Gemini 3)
+                                            let thought_signature = part.get("thoughtSignature")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string());
+
+                                            // Also store in map for lookup when building functionResponse
+                                            if let Some(ref sig) = thought_signature {
+                                                google_thought_signatures.insert(id.clone(), sig.clone());
+                                            }
+
                                             tool_uses.push(ToolUse {
                                                 id: id.clone(),
                                                 name: name.clone(),
                                                 input: args.clone(),
+                                                thought_signature,
                                             });
 
                                             let _ = window.emit("chat-event", ChatEvent::ToolStart {
@@ -899,6 +913,7 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
                                                     id: id.clone(),
                                                     name: name.clone(),
                                                     input: input.clone(),
+                                                    thought_signature: None, // OpenAI doesn't use thought signatures
                                                 });
 
                                                 // Emit tool start
@@ -982,6 +997,7 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
                                             id: current_tool_id.clone(),
                                             name: current_tool_name.clone(),
                                             input: input.clone(),
+                                            thought_signature: None, // Anthropic doesn't use thought signatures
                                         });
 
                                         // Emit tool start
@@ -1021,6 +1037,7 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
                     id: tu.id.clone(),
                     name: tu.name.clone(),
                     input: tu.input.clone(),
+                    thought_signature: tu.thought_signature.clone(),
                 });
             }
             AgentContent::Blocks(blocks)
@@ -1520,6 +1537,7 @@ fn convert_to_google_format(
     request: &crate::agent::message_builder::ClaudeApiRequest,
     _model: &str,
     max_tokens: u32,
+    thought_signatures: &std::collections::HashMap<String, String>,
 ) -> serde_json::Value {
     use crate::agent::message_builder::ApiContent;
 
@@ -1547,24 +1565,36 @@ fn convert_to_google_format(
                             }
                         }
                         "tool_use" => {
-                            // Convert to functionCall format
-                            parts_list.push(serde_json::json!({
+                            // Convert to functionCall format with thoughtSignature if present (for Gemini 3)
+                            let tool_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            let mut fc_part = serde_json::json!({
                                 "functionCall": {
                                     "name": block.get("name"),
                                     "args": block.get("input")
                                 }
-                            }));
+                            });
+                            // Include thoughtSignature if we have it for this tool
+                            if let Some(sig) = thought_signatures.get(tool_id) {
+                                fc_part["thoughtSignature"] = serde_json::json!(sig);
+                            }
+                            parts_list.push(fc_part);
                         }
                         "tool_result" => {
-                            // Convert to functionResponse format
-                            parts_list.push(serde_json::json!({
+                            // Convert to functionResponse format with thoughtSignature (required for Gemini 3)
+                            let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            let mut fr_part = serde_json::json!({
                                 "functionResponse": {
-                                    "name": block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                                    "name": tool_use_id,
                                     "response": {
                                         "content": block.get("content")
                                     }
                                 }
-                            }));
+                            });
+                            // Include thoughtSignature from matching tool_use (required for Gemini 3)
+                            if let Some(sig) = thought_signatures.get(tool_use_id) {
+                                fr_part["thoughtSignature"] = serde_json::json!(sig);
+                            }
+                            parts_list.push(fr_part);
                         }
                         _ => {}
                     }

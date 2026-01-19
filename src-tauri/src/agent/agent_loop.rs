@@ -154,6 +154,7 @@ impl AgentLoop {
                         id: tu.id.clone(),
                         name: tu.name.clone(),
                         input: tu.input.clone(),
+                        thought_signature: tu.thought_signature.clone(),
                     });
                 }
                 AgentContent::Blocks(blocks)
@@ -469,6 +470,23 @@ impl AgentLoop {
     ) -> serde_json::Value {
         use crate::agent::message_builder::ApiContent;
 
+        // Build a map of tool_use_id -> thought_signature for looking up when building functionResponse
+        let mut thought_signatures: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for msg in &request.messages {
+            if let ApiContent::Blocks(blocks) = &msg.content {
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                        if let (Some(id), Some(sig)) = (
+                            block.get("id").and_then(|v| v.as_str()),
+                            block.get("thought_signature").and_then(|v| v.as_str()),
+                        ) {
+                            thought_signatures.insert(id.to_string(), sig.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         // Build contents array
         let mut contents: Vec<serde_json::Value> = Vec::new();
 
@@ -493,24 +511,38 @@ impl AgentLoop {
                                 }
                             }
                             "tool_use" => {
-                                // Convert to functionCall format
-                                parts_list.push(serde_json::json!({
+                                // Convert to functionCall format with thoughtSignature if present
+                                let mut fc_part = serde_json::json!({
                                     "functionCall": {
                                         "name": block.get("name"),
                                         "args": block.get("input")
                                     }
-                                }));
+                                });
+                                // Include thoughtSignature if present (for Gemini 3)
+                                if let Some(sig) = block.get("thought_signature").and_then(|v| v.as_str()) {
+                                    fc_part["thoughtSignature"] = serde_json::json!(sig);
+                                }
+                                parts_list.push(fc_part);
                             }
                             "tool_result" => {
-                                // Convert to functionResponse format
-                                parts_list.push(serde_json::json!({
+                                // Convert to functionResponse format with thoughtSignature
+                                let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+                                let mut fr_part = serde_json::json!({
                                     "functionResponse": {
-                                        "name": block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                                        "name": tool_use_id,
                                         "response": {
                                             "content": block.get("content")
                                         }
                                     }
-                                }));
+                                });
+
+                                // Include thoughtSignature from matching tool_use (required for Gemini 3)
+                                if let Some(sig) = thought_signatures.get(tool_use_id) {
+                                    fr_part["thoughtSignature"] = serde_json::json!(sig);
+                                }
+
+                                parts_list.push(fr_part);
                             }
                             _ => {}
                         }
@@ -550,15 +582,11 @@ impl AgentLoop {
             });
         }
 
-        // Add tools if present - disable thinking for function calling to avoid thought_signature issues
+        // Add tools if present
         if !function_declarations.is_empty() {
             google_request["tools"] = serde_json::json!([{
                 "functionDeclarations": function_declarations
             }]);
-            // Disable thinking for function calling (thinkingBudget: 0)
-            google_request["generationConfig"]["thinkingConfig"] = serde_json::json!({
-                "thinkingBudget": 0
-            });
         }
 
         google_request
@@ -614,18 +642,28 @@ impl AgentLoop {
                                             }).await;
                                         }
                                     }
-                                    // Handle function calls
+                                    // Handle function calls (with thoughtSignature for Gemini 3)
                                     if let Some(fc) = part.get("functionCall") {
                                         let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                         let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
                                         let id = format!("fc_{}", uuid::Uuid::new_v4());
 
-                                        tool_calls.push(serde_json::json!({
+                                        // Capture thoughtSignature from the same part (required for Gemini 3)
+                                        let thought_sig = part.get("thoughtSignature").and_then(|v| v.as_str());
+
+                                        let mut tool_use = serde_json::json!({
                                             "type": "tool_use",
                                             "id": id,
                                             "name": name,
                                             "input": args
-                                        }));
+                                        });
+
+                                        // Store thoughtSignature with tool_use for later use in functionResponse
+                                        if let Some(sig) = thought_sig {
+                                            tool_use["thought_signature"] = serde_json::json!(sig);
+                                        }
+
+                                        tool_calls.push(tool_use);
                                     }
                                 }
                             }
@@ -897,8 +935,12 @@ impl AgentLoop {
                         .unwrap_or("")
                         .to_string();
                     let input = block.get("input").cloned().unwrap_or(serde_json::json!({}));
+                    let thought_signature = block
+                        .get("thought_signature")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
 
-                    tool_uses.push(ToolUse { id, name, input });
+                    tool_uses.push(ToolUse { id, name, input, thought_signature });
                 }
                 _ => {}
             }
