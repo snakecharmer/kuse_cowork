@@ -163,6 +163,25 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>) -> Result<String, 
                     Err(e) => Ok(format!("Error: {}", e)),
                 }
             }
+            "google" => {
+                // Google Gemini - test with actual API request
+                let llm_client = LLMClient::new(
+                    settings.api_key.clone(),
+                    Some(settings.base_url.clone()),
+                    Some("google"),
+                    Some(&settings.model),
+                );
+
+                let test_messages = vec![Message {
+                    role: "user".to_string(),
+                    content: "Hi".to_string(),
+                }];
+
+                match llm_client.send_message(test_messages, &settings.model, 10, None).await {
+                    Ok(_) => Ok("success".to_string()),
+                    Err(e) => Ok(format!("Error: {}", e)),
+                }
+            }
             _ => {
                 // Other cloud services - try sending a test message
                 let llm_client = LLMClient::new(
@@ -664,10 +683,14 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
         provider_config.base_url = settings.base_url.clone();
     }
 
-    // Check if we should use OpenAI format
+    // Determine API format
     let use_openai_format = matches!(
         provider_config.api_format,
         crate::llm_client::ApiFormat::OpenAI | crate::llm_client::ApiFormat::OpenAICompatible
+    );
+    let use_google_format = matches!(
+        provider_config.api_format,
+        crate::llm_client::ApiFormat::Google
     );
 
     loop {
@@ -679,7 +702,20 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
         // Build and send request
         let api_request = message_builder.build_request(&agent_messages).await;
 
-        let response = if use_openai_format {
+        let response = if use_google_format {
+            // Google Gemini format request
+            let google_request = convert_to_google_format(&api_request, &settings.model, settings.max_tokens);
+            let base = provider_config.base_url.trim_end_matches('/');
+            let url = format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, settings.model);
+
+            client.post(&url)
+                .header("Content-Type", "application/json")
+                .header("x-goog-api-key", &settings.api_key)
+                .json(&google_request)
+                .send()
+                .await
+                .map_err(|e| CommandError { message: format!("HTTP error: {}", e) })?
+        } else if use_openai_format {
             // OpenAI format request
             let openai_request = convert_to_openai_format(&api_request, &settings.model);
             let base = provider_config.base_url.trim_end_matches('/');
@@ -735,7 +771,70 @@ Be concise and helpful. Explain what you're doing when using tools.{}"#, mcp_inf
         let mut accumulated_text = String::new();
         let mut tool_uses: Vec<ToolUse> = Vec::new();
 
-        if use_openai_format {
+        if use_google_format {
+            // Google Gemini streaming format (SSE with alt=sse)
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| CommandError { message: format!("Stream error: {}", e) })?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim().to_string();
+                    buffer = buffer[pos + 1..].to_string();
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    // Parse SSE data: prefix
+                    let json_str = if let Some(data) = line.strip_prefix("data: ") {
+                        data
+                    } else {
+                        continue;
+                    };
+
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        // Extract text and function calls from candidates
+                        if let Some(candidates) = event.get("candidates").and_then(|v| v.as_array()) {
+                            for candidate in candidates {
+                                if let Some(parts) = candidate.get("content")
+                                    .and_then(|c| c.get("parts"))
+                                    .and_then(|p| p.as_array())
+                                {
+                                    for part in parts {
+                                        // Handle text
+                                        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                            if !text.is_empty() {
+                                                accumulated_text.push_str(text);
+                                                let _ = window.emit("chat-event", ChatEvent::Text {
+                                                    content: accumulated_text.clone(),
+                                                });
+                                            }
+                                        }
+                                        // Handle function calls
+                                        if let Some(fc) = part.get("functionCall") {
+                                            let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                                            let id = format!("fc_{}", uuid::Uuid::new_v4());
+
+                                            tool_uses.push(ToolUse {
+                                                id: id.clone(),
+                                                name: name.clone(),
+                                                input: args.clone(),
+                                            });
+
+                                            let _ = window.emit("chat-event", ChatEvent::ToolStart {
+                                                tool: name,
+                                                input: args,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if use_openai_format {
             // OpenAI streaming format
             let mut current_tool_calls: std::collections::HashMap<i64, (String, String, String)> = std::collections::HashMap::new();
 
@@ -1414,4 +1513,103 @@ fn convert_to_openai_format(
     }
 
     openai_request
+}
+
+/// Convert Claude API request format to Google Gemini format
+fn convert_to_google_format(
+    request: &crate::agent::message_builder::ClaudeApiRequest,
+    _model: &str,
+    max_tokens: u32,
+) -> serde_json::Value {
+    use crate::agent::message_builder::ApiContent;
+
+    // Build contents array
+    let mut contents: Vec<serde_json::Value> = Vec::new();
+
+    // Convert messages to Google format
+    for msg in &request.messages {
+        // Google uses "user" and "model" instead of "user" and "assistant"
+        let role = if msg.role == "assistant" { "model" } else { &msg.role };
+
+        let parts = match &msg.content {
+            ApiContent::Text(text) => {
+                vec![serde_json::json!({"text": text})]
+            }
+            ApiContent::Blocks(blocks) => {
+                let mut parts_list = Vec::new();
+                for block in blocks {
+                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    match block_type {
+                        "text" => {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                parts_list.push(serde_json::json!({"text": text}));
+                            }
+                        }
+                        "tool_use" => {
+                            // Convert to functionCall format
+                            parts_list.push(serde_json::json!({
+                                "functionCall": {
+                                    "name": block.get("name"),
+                                    "args": block.get("input")
+                                }
+                            }));
+                        }
+                        "tool_result" => {
+                            // Convert to functionResponse format
+                            parts_list.push(serde_json::json!({
+                                "functionResponse": {
+                                    "name": block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                                    "response": {
+                                        "content": block.get("content")
+                                    }
+                                }
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                parts_list
+            }
+        };
+
+        if !parts.is_empty() {
+            contents.push(serde_json::json!({
+                "role": role,
+                "parts": parts
+            }));
+        }
+    }
+
+    // Convert tools to Google functionDeclarations format
+    let function_declarations: Vec<serde_json::Value> = request.tools.iter().map(|tool| {
+        serde_json::json!({
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.input_schema
+        })
+    }).collect();
+
+    let mut google_request = serde_json::json!({
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": max_tokens
+        }
+    });
+
+    // Add system instruction if present
+    if !request.system.is_empty() {
+        google_request["systemInstruction"] = serde_json::json!({
+            "parts": [{"text": request.system}]
+        });
+    }
+
+    // Add tools if present
+    if !function_declarations.is_empty() {
+        google_request["tools"] = serde_json::json!([{
+            "functionDeclarations": function_declarations
+        }]);
+    }
+
+    google_request
 }

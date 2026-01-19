@@ -368,6 +368,7 @@ impl LLMClient {
             ApiFormat::Anthropic => self.send_anthropic(messages, model, max_tokens, temperature, false, None).await,
             ApiFormat::OpenAI | ApiFormat::OpenAICompatible => self.send_openai_compatible(messages, model, max_tokens, temperature, false, None).await,
             ApiFormat::OpenAIResponses => self.send_openai_responses(messages, model, max_tokens, temperature, false, None).await,
+            ApiFormat::Google => self.send_google(messages, model, max_tokens, temperature, false, None).await,
             _ => Err(LLMError::UnsupportedProvider(format!("{:?}", self.provider_config.api_format))),
         }
     }
@@ -385,6 +386,7 @@ impl LLMClient {
             ApiFormat::Anthropic => self.send_anthropic(messages, model, max_tokens, temperature, true, Some(tx)).await,
             ApiFormat::OpenAI | ApiFormat::OpenAICompatible => self.send_openai_compatible(messages, model, max_tokens, temperature, true, Some(tx)).await,
             ApiFormat::OpenAIResponses => self.send_openai_responses(messages, model, max_tokens, temperature, true, Some(tx)).await,
+            ApiFormat::Google => self.send_google(messages, model, max_tokens, temperature, true, Some(tx)).await,
             _ => Err(LLMError::UnsupportedProvider(format!("{:?}", self.provider_config.api_format))),
         }
     }
@@ -725,6 +727,142 @@ impl LLMClient {
                             if let Some(final_text) = Self::parse_responses_response(&event["response"]) {
                                 if !final_text.is_empty() && final_text != full_text {
                                     full_text = final_text;
+                                    let _ = tx.send(full_text.clone()).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(full_text)
+    }
+
+    /// Google Gemini API call
+    async fn send_google(
+        &self,
+        messages: Vec<Message>,
+        model: &str,
+        max_tokens: u32,
+        _temperature: Option<f32>, // Gemini 3 recommends keeping temperature at default 1.0
+        stream: bool,
+        tx: Option<mpsc::Sender<String>>,
+    ) -> Result<String, LLMError> {
+        // Google Gemini API uses a different endpoint format:
+        // https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+        // or for streaming: :streamGenerateContent?alt=sse
+        let base = self.base_url.trim_end_matches('/');
+        let action = if stream { "streamGenerateContent" } else { "generateContent" };
+        // Use alt=sse for streaming to get Server-Sent Events format
+        let url = if stream {
+            format!("{}/v1beta/models/{}:{}?alt=sse", base, model, action)
+        } else {
+            format!("{}/v1beta/models/{}:{}", base, model, action)
+        };
+
+        // Convert messages to Google format
+        // Google uses "contents" with "parts" structure
+        let contents: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                // Google uses "user" and "model" instead of "user" and "assistant"
+                let role = if m.role == "assistant" { "model" } else { &m.role };
+                serde_json::json!({
+                    "role": role,
+                    "parts": [{"text": m.content}]
+                })
+            })
+            .collect();
+
+        // Build payload - Gemini 3 recommends NOT setting custom temperature (keep at default 1.0)
+        let payload = serde_json::json!({
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": max_tokens
+            }
+        });
+
+        // Use x-goog-api-key header for authentication (recommended for Gemini 3)
+        let response = self.client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &self.api_key)
+            .json(&payload)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(LLMError::Api(error_text));
+        }
+
+        if stream {
+            self.handle_google_stream(response, tx.unwrap()).await
+        } else {
+            let data: serde_json::Value = response.json().await?;
+            // Google response: candidates[0].content.parts[0].text
+            let text = data["candidates"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|candidate| candidate["content"]["parts"].as_array())
+                .and_then(|parts| parts.first())
+                .and_then(|part| part["text"].as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(text)
+        }
+    }
+
+    /// Handle Google Gemini streaming response (SSE format with alt=sse)
+    async fn handle_google_stream(
+        &self,
+        response: reqwest::Response,
+        tx: mpsc::Sender<String>,
+    ) -> Result<String, LLMError> {
+        use futures::StreamExt;
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut full_text = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // With alt=sse, Google returns SSE format: "data: {...}\n\n"
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer = buffer[pos + 1..].to_string();
+
+                // Skip empty lines
+                if line.is_empty() {
+                    continue;
+                }
+
+                // Parse SSE data: prefix
+                let json_str = if let Some(data) = line.strip_prefix("data: ") {
+                    data
+                } else {
+                    // Also handle raw JSON (fallback for non-SSE responses)
+                    line.trim_start_matches('[').trim_end_matches(']').trim_end_matches(',')
+                };
+
+                if json_str.is_empty() {
+                    continue;
+                }
+
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    // Extract text from candidates[0].content.parts[0].text
+                    if let Some(parts) = event["candidates"]
+                        .as_array()
+                        .and_then(|arr| arr.first())
+                        .and_then(|candidate| candidate["content"]["parts"].as_array())
+                    {
+                        for part in parts {
+                            if let Some(text) = part["text"].as_str() {
+                                if !text.is_empty() {
+                                    full_text.push_str(text);
                                     let _ = tx.send(full_text.clone()).await;
                                 }
                             }

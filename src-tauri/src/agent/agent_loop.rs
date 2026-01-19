@@ -222,6 +222,7 @@ impl AgentLoop {
             ApiFormat::OpenAI | ApiFormat::OpenAICompatible => {
                 self.send_openai_request(request, event_tx).await
             }
+            ApiFormat::Google => self.send_google_request(request, event_tx).await,
             _ => Err(format!("Unsupported API format: {:?}", self.provider_config.api_format)),
         }
     }
@@ -431,6 +432,222 @@ impl AgentLoop {
         }
 
         openai_request
+    }
+
+    /// Send Google Gemini format request
+    async fn send_google_request(
+        &self,
+        request: &crate::agent::message_builder::ClaudeApiRequest,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<serde_json::Value, String> {
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, request.model);
+
+        // Convert request format to Google format
+        let google_request = self.convert_to_google_format(request);
+
+        let response = self.client.post(&url)
+            .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &self.api_key)
+            .json(&google_request)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP error: {}", e))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!("API error: {}", error_text));
+        }
+
+        self.handle_google_stream_response(response, event_tx).await
+    }
+
+    /// Convert Claude request format to Google Gemini format
+    fn convert_to_google_format(
+        &self,
+        request: &crate::agent::message_builder::ClaudeApiRequest,
+    ) -> serde_json::Value {
+        use crate::agent::message_builder::ApiContent;
+
+        // Build contents array
+        let mut contents: Vec<serde_json::Value> = Vec::new();
+
+        // Convert messages to Google format
+        for msg in &request.messages {
+            // Google uses "user" and "model" instead of "user" and "assistant"
+            let role = if msg.role == "assistant" { "model" } else { &msg.role };
+
+            let parts = match &msg.content {
+                ApiContent::Text(text) => {
+                    vec![serde_json::json!({"text": text})]
+                }
+                ApiContent::Blocks(blocks) => {
+                    let mut parts_list = Vec::new();
+                    for block in blocks {
+                        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                        match block_type {
+                            "text" => {
+                                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                    parts_list.push(serde_json::json!({"text": text}));
+                                }
+                            }
+                            "tool_use" => {
+                                // Convert to functionCall format
+                                parts_list.push(serde_json::json!({
+                                    "functionCall": {
+                                        "name": block.get("name"),
+                                        "args": block.get("input")
+                                    }
+                                }));
+                            }
+                            "tool_result" => {
+                                // Convert to functionResponse format
+                                parts_list.push(serde_json::json!({
+                                    "functionResponse": {
+                                        "name": block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                                        "response": {
+                                            "content": block.get("content")
+                                        }
+                                    }
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                    parts_list
+                }
+            };
+
+            if !parts.is_empty() {
+                contents.push(serde_json::json!({
+                    "role": role,
+                    "parts": parts
+                }));
+            }
+        }
+
+        // Convert tools to Google functionDeclarations format
+        let function_declarations: Vec<serde_json::Value> = request.tools.iter().map(|tool| {
+            serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema
+            })
+        }).collect();
+
+        let mut google_request = serde_json::json!({
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": request.max_tokens
+            }
+        });
+
+        // Add system instruction if present
+        if !request.system.is_empty() {
+            google_request["systemInstruction"] = serde_json::json!({
+                "parts": [{"text": request.system}]
+            });
+        }
+
+        // Add tools if present - disable thinking for function calling to avoid thought_signature issues
+        if !function_declarations.is_empty() {
+            google_request["tools"] = serde_json::json!([{
+                "functionDeclarations": function_declarations
+            }]);
+            // Disable thinking for function calling (thinkingBudget: 0)
+            google_request["generationConfig"]["thinkingConfig"] = serde_json::json!({
+                "thinkingBudget": 0
+            });
+        }
+
+        google_request
+    }
+
+    /// Handle Google Gemini streaming response
+    async fn handle_google_stream_response(
+        &self,
+        response: reqwest::Response,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<serde_json::Value, String> {
+        use futures::StreamExt;
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut accumulated_text = String::new();
+        let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer = buffer[pos + 1..].to_string();
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                // Parse SSE data: prefix
+                let json_str = if let Some(data) = line.strip_prefix("data: ") {
+                    data
+                } else {
+                    continue;
+                };
+
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    // Extract text and function calls from candidates
+                    if let Some(candidates) = event.get("candidates").and_then(|v| v.as_array()) {
+                        for candidate in candidates {
+                            if let Some(parts) = candidate.get("content")
+                                .and_then(|c| c.get("parts"))
+                                .and_then(|p| p.as_array())
+                            {
+                                for part in parts {
+                                    // Handle text
+                                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                        if !text.is_empty() {
+                                            accumulated_text.push_str(text);
+                                            let _ = event_tx.send(AgentEvent::Text {
+                                                content: accumulated_text.clone(),
+                                            }).await;
+                                        }
+                                    }
+                                    // Handle function calls
+                                    if let Some(fc) = part.get("functionCall") {
+                                        let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                        let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                                        let id = format!("fc_{}", uuid::Uuid::new_v4());
+
+                                        tool_calls.push(serde_json::json!({
+                                            "type": "tool_use",
+                                            "id": id,
+                                            "name": name,
+                                            "input": args
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build Claude format response
+        let mut content = Vec::new();
+        if !accumulated_text.is_empty() {
+            content.push(serde_json::json!({
+                "type": "text",
+                "text": accumulated_text
+            }));
+        }
+        content.extend(tool_calls);
+
+        Ok(serde_json::json!({
+            "content": content
+        }))
     }
 
     /// Handle OpenAI streaming response

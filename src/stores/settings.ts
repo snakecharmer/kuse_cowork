@@ -176,7 +176,7 @@ export const AVAILABLE_MODELS = [
   { id: "gpt-4-turbo", name: "GPT-4 Turbo", description: "Fast GPT-4", provider: "openai", baseUrl: "https://api.openai.com" },
 
   // Gemini Models (Google)
-  { id: "gemini-3-pro", name: "Gemini 3 Pro", description: "Google's latest model", provider: "google", baseUrl: "https://generativelanguage.googleapis.com" },
+  { id: "gemini-3-pro-preview", name: "Gemini 3 Pro", description: "Google's latest model", provider: "google", baseUrl: "https://generativelanguage.googleapis.com" },
 
   // Minimax Models
   { id: "minimax-m2.1", name: "Minimax M2.1", description: "Advanced Chinese model", provider: "minimax", baseUrl: "https://api.minimax.chat" },
